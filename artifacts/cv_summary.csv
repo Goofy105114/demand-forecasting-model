@@ -1,0 +1,9 @@
+,WAPE_%,WAPE_%,sMAPE_%,sMAPE_%
+,mean,std,mean,std
+Model,,,,
+Gradient Boosting,13.2,2.62,45.13,13.53
+Hist Gradient Boosting,14.47,3.74,47.85,12.15
+Linear Regression,15.38,2.26,44.71,14.19
+Moving average (3 mo),14.86,2.18,44.24,11.81
+Random Forest,13.77,2.59,45.15,14.06
+Ridge Regression,14.59,2.13,44.47,14.18

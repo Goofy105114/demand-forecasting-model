@@ -1,0 +1,598 @@
+================================================================================
+        PRODUCTION DEMAND FORECASTING — COMPLETE VIVA STUDY NOTES
+================================================================================
+ML Case Study 95 | Dataset: Kaggle "Forecasts for Product Demand"
+
+This file covers everything you need to know to explain this project from scratch
+in a viva — problem, data, cleaning, features, models, results, deployment, and
+the "why" behind every decision.
+
+================================================================================
+SECTION 1: THE PROBLEM
+================================================================================
+
+WHAT ARE WE DOING?
+  A manufacturer operates across multiple warehouses and sells products grouped
+  into categories. They need to know HOW MUCH to produce each month so they
+  don't run out of stock or overproduce. This is a DEMAND FORECASTING problem.
+
+GRANULARITY:
+  We forecast at the level of: Warehouse x Product_Category, monthly.
+  Example: "How many units of Category_019 will Warehouse J need in August?"
+
+TOTAL SERIES: 33 (warehouse–category combinations that meet our quality filter)
+
+OUTPUT: Monthly demand forecast, up to 6 months ahead.
+
+WHY IS THIS HARD?
+  - Demand can be lumpy (some months near zero, some very high)
+  - Multiple series with very different scales (thousands to millions)
+  - Limited history (only ~5 years monthly = 60 data points per series)
+  - No external signals (no prices, promotions, or economic data)
+
+================================================================================
+SECTION 2: THE DATASET
+================================================================================
+
+SOURCE: Kaggle — "Forecasts for Product Demand"
+RAW SIZE: 1,048,575 rows (about 1 million order records)
+COLUMNS: Product_Code, Warehouse, Product_Category, Date, Order_Demand
+
+DATE RANGE IN DATA: roughly 2011–2017
+DATE RANGE WE USE: January 2012 – December 2016
+  WHY NOT 2011 AND 2017? Those years are almost empty (very few records).
+  Including them would create sparse boundaries that corrupt lag features.
+
+WHAT ONE ROW MEANS:
+  One row = one order. Same product can appear multiple times on the same day.
+  These are ORDER quantities, not actual consumer demand — important limitation.
+
+================================================================================
+SECTION 3: DATA CLEANING (pipeline.py → clean() function)
+================================================================================
+
+STEP 1 — Bracketed Negatives
+  PROBLEM: Values like "(100)" are accounting notation for negative 100.
+           pandas reads these as strings, not numbers.
+  FIX: Detect rows where Order_Demand contains "(", strip the brackets,
+       convert to number, multiply by -1.
+  COUNT: 10,469 such values found and fixed.
+
+STEP 2 — Missing/Unparseable Dates
+  PROBLEM: Some date strings could not be parsed by pandas.
+  FIX: Use errors="coerce" when parsing dates → bad dates become NaT → drop those rows.
+  COUNT: 11,239 rows dropped.
+
+STEP 3 — Exact Duplicate Rows
+  OBSERVATION: 113,064 exact duplicate rows found.
+  DECISION: KEPT (not dropped).
+  REASON: The same product can legitimately be ordered twice on one day
+          (verified: duplicates are overwhelmingly round-number quantities,
+          consistent with real repeat orders, not data entry errors).
+
+STEP 4 — Negative Demand (Returns)
+  OBSERVATION: 5,899 rows have negative Order_Demand after fixing bracketed values.
+  DECISION: KEPT as-is.
+  REASON: Negative demand = product returns. These affect true net demand
+          and should be included in monthly aggregation.
+
+STEP 5 — Date Filter
+  Keep only rows from 2012-01-01 to 2016-12-31.
+  ROWS REMAINING: 1,036,643
+
+================================================================================
+SECTION 4: AGGREGATION (pipeline.py → monthly_series() function)
+================================================================================
+
+GOAL: Convert raw order rows into a clean monthly time series per series.
+
+STEPS:
+  1. Create a "Month" column = first day of the month (Period → Timestamp).
+  2. Group by (Warehouse, Product_Category, Month) and SUM Order_Demand.
+  3. Create a full calendar grid: every month from Jan 2012 to Dec 2016.
+  4. For each series, REINDEX to the full grid and fill missing months with 0.
+     (A month with no orders = zero demand, not missing data.)
+
+SERIES FILTERING:
+  Only keep series that meet BOTH criteria:
+    - At least 36 ACTIVE MONTHS (months with demand > 0)
+    - At least 1,000,000 TOTAL DEMAND over the period
+  REASON: Series with sparse data or tiny volume are too noisy to forecast
+          reliably. They would inflate error metrics without providing value.
+  RESULT: 33 series remain.
+
+================================================================================
+SECTION 5: FEATURE ENGINEERING (pipeline.py → make_features() function)
+================================================================================
+
+KEY PRINCIPLE: NO DATA LEAKAGE.
+  Every feature for predicting month t uses ONLY data from month t-1 or earlier.
+  This mimics how you'd use the model in production (you never have future data).
+
+FEATURE LIST (13 total):
+
+  LAG FEATURES (5):
+    lag_1  = demand 1 month ago
+    lag_2  = demand 2 months ago
+    lag_3  = demand 3 months ago
+    lag_6  = demand 6 months ago
+    lag_12 = demand 12 months ago  ← captures yearly seasonality
+
+  ROLLING WINDOW FEATURES (3):
+    All computed starting from lag_1 (shifted by 1 first, then rolling):
+    roll_mean_3 = mean of last 3 months (t-1, t-2, t-3)
+    roll_mean_6 = mean of last 6 months
+    roll_std_3  = standard deviation of last 3 months (captures volatility)
+
+  CALENDAR FEATURES (5):
+    month   = month number (1–12)
+    quarter = quarter (1–4)
+    month_sin = sin(2π × month/12)
+    month_cos = cos(2π × month/12)
+    [year is created but NOT included in model features]
+
+WHY CYCLICAL ENCODING (sin/cos)?
+  Plain month integers treat December (12) and January (1) as far apart.
+  But they are adjacent months. sin/cos wraps the calendar into a circle:
+  Dec → Jan is a small step, not a jump from 12 back to 1.
+  This helps the model learn winter/summer patterns correctly.
+
+WHY LOG-TRANSFORM FEATURES?
+  Series range from ~4,000 total demand (small) to ~287 million (Category_019).
+  Without transformation, the model treats a 1,000-unit error on a small series
+  the same as on a huge series. Log-transform compresses the scale so
+  ONE MODEL can handle all 33 series fairly.
+  Applied to: all lag and rolling features, AND the target (Demand).
+  Formula: log1p(x) = log(1 + x)  [handles zeros safely]
+  Inverse: expm1(x) = e^x - 1     [used to convert predictions back]
+
+WHAT HAPPENS AFTER make_features()?
+  Rows where lag or rolling features are NaN (the first ~12 months of each series,
+  where we don't have enough history yet) are dropped with dropna().
+
+================================================================================
+SECTION 6: TRAIN / TEST SPLIT
+================================================================================
+
+METHOD: TIME-BASED SPLIT (never shuffle time series data)
+  Training set: Jan 2012 – Jun 2016
+  Test set:     Jul 2016 – Dec 2016  (last 6 months = "hold-out")
+
+WHY NOT RANDOM SPLIT?
+  Shuffling would let the model "see" future data during training (leakage).
+  For example, a shuffled test set might include Jan 2015 while the training
+  set includes Dec 2015 — the model would have been trained on the future.
+
+================================================================================
+SECTION 7: MODELS (pipeline.py → get_models() function)
+================================================================================
+
+BASELINES (no ML, simple rules):
+  1. Naive (last month)     — predict = lag_1 (whatever demand was last month)
+  2. Seasonal Naive (12mo)  — predict = lag_12 (same month last year)
+  3. Moving Average (3mo)   — predict = roll_mean_3 (average of last 3 months)
+
+  Baselines are essential to check: is our ML model actually better than
+  something trivial? If not, the ML model isn't worth the complexity.
+
+ML MODELS (all from scikit-learn):
+  1. Linear Regression     — no regularization, simple baseline
+  2. Ridge Regression      — Linear Regression + L2 regularization (alpha=10)
+                             + StandardScaler (features normalized first)
+  3. Random Forest         — 300 decision trees, min_samples_leaf=3
+  4. Gradient Boosting     — 300 estimators, learning_rate=0.05, max_depth=3
+  5. Hist Gradient Boosting — histogram-based GBM, 300 iterations, lr=0.05
+                              (faster than GBR, handles missing values natively)
+
+HOW MODELS ARE TRAINED:
+  - Input X: the 13 features (log-transformed demand-scale ones via prep_X())
+  - Target y: log1p(Demand) — train on log scale
+  - Predict: model.predict(X) → expm1() → clip to ≥ 0
+
+ALL 33 SERIES ARE TRAINED TOGETHER (global model):
+  One model sees all series. Series identity is implicitly captured by the
+  feature values themselves (different lag patterns per series).
+
+================================================================================
+SECTION 8: EVALUATION METRICS
+================================================================================
+
+PRIMARY METRIC: WAPE % (Weighted Absolute Percentage Error)
+  Formula: WAPE = Σ|actual - predicted| / Σ|actual| × 100
+
+  WHY WAPE?
+    - MAPE divides each error by that month's actual demand. If a month has
+      near-zero demand, one small absolute error becomes a huge percentage error.
+      WAPE avoids this by dividing by the TOTAL actual demand (sum).
+    - It's also intuitive: "our total error is X% of total actual demand."
+    - Lower is better. 0% = perfect.
+
+SECONDARY METRICS:
+  MAE  (Mean Absolute Error)    — average absolute error in original units
+  RMSE (Root Mean Squared Error) — penalizes large errors more
+  sMAPE (Symmetric MAPE)        — alternative percentage error, symmetric
+  R²   (R-squared)              — proportion of variance explained (closer to 1 = better)
+
+================================================================================
+SECTION 9: CROSS-VALIDATION (train.py)
+================================================================================
+
+METHOD: Rolling-Origin Cross-Validation (3 folds)
+  Each fold:
+    - Training: all data before the cutoff
+    - Validation: the 6 months after the cutoff
+  Cutoffs used: months[-18], months[-12], months[-6]
+  (Expanding window: each fold has MORE training data than the previous)
+
+WHY NOT K-FOLD CV?
+  K-fold shuffles data. For time series, that causes leakage. Rolling-origin
+  CV always trains on the past and validates on the future — exactly how the
+  model will be used in production.
+
+CV RESULTS (mean WAPE % over 3 folds):
+  Gradient Boosting        13.2%  ← WINNER (lowest mean)
+  Random Forest            13.77%
+  Hist Gradient Boosting   14.47%
+  Ridge Regression         14.59%
+  Moving Average (3mo)     14.86%
+  Linear Regression        15.38%
+
+================================================================================
+SECTION 10: HYPERPARAMETER TUNING (train.py)
+================================================================================
+
+MODEL TUNED: HistGradientBoostingRegressor (best family for raw performance)
+
+APPROACH: Manual grid search on a separate inner validation window
+  (not the final test set, to avoid double-dipping)
+  Inner window: months[-12] to months[-6] (6-month validation period)
+
+GRID (12 combinations):
+  learning_rate    : 0.03, 0.05, 0.1
+  max_iter         : 200, 400
+  min_samples_leaf : 10, 20
+
+RESULTS (top 3):
+  lr=0.05, max_iter=200, min_samples_leaf=10  → val WAPE 16.32%  ← BEST
+  lr=0.03, max_iter=200, min_samples_leaf=10  → val WAPE 16.44%
+  lr=0.03, max_iter=400, min_samples_leaf=10  → val WAPE 16.68%
+
+OUTCOME: Tuned HGB still didn't beat GBR in rolling-origin CV, so
+         Gradient Boosting remained the champion.
+
+================================================================================
+SECTION 11: HOLD-OUT TEST RESULTS (Jul–Dec 2016)
+================================================================================
+
+Model                          MAE          RMSE        WAPE%    R²
+----------------------------------------------------------------------
+Naive (last month)             408,944    1,212,029     16.2%   0.979
+Seasonal Naive (12mo)          498,242    1,637,361     19.8%   0.962
+Moving Average (3mo)           312,011      942,171     12.4%   0.987  ← best baseline
+Linear Regression              333,541    1,045,341     13.2%   0.985
+Ridge Regression               324,925      976,256     12.9%   0.987
+Random Forest                  293,024      979,905     11.6%   0.986
+Gradient Boosting              297,192    1,026,211     11.8%   0.985  ← CHAMPION
+Hist Gradient Boosting         258,946      861,915     10.3%   0.989  ← best hold-out
+Hist Gradient Boosting (tuned) 265,888      957,247     10.5%   0.987
+
+NOTE: HGB wins on hold-out (10.3%) but GBR wins on CV (13.2% mean).
+      We pick by CV because it's more robust (3 windows, not 1).
+
+================================================================================
+SECTION 12: CHAMPION MODEL SELECTION
+================================================================================
+
+CHAMPION: Gradient Boosting
+CONFIG:   GradientBoostingRegressor(n_estimators=300, learning_rate=0.05,
+                                    max_depth=3, random_state=42)
+
+SELECTION LOGIC:
+  Champion = model with LOWEST MEAN WAPE across rolling-origin CV folds.
+  NOT chosen by hold-out performance alone.
+
+THE KEY QUESTION YOU WILL BE ASKED:
+  "HGB has better hold-out WAPE (10.3%) than GBR (11.8%). Why pick GBR?"
+
+  ANSWER:
+  1. Hold-out is ONE window (Jul–Dec 2016). It could be lucky/unlucky.
+  2. CV averages over THREE windows at different points in time.
+  3. On CV: GBR mean = 13.2%, HGB mean = 14.47% — GBR is more consistent.
+  4. HGB also has higher CV variance (std 3.74 vs 2.62), meaning it's less stable.
+  5. A model that generalizes reliably across time is more trustworthy in
+     production than one that happens to be best on one specific window.
+
+AFTER SELECTION:
+  All models are refit on THE FULL DATASET (training + test combined) before
+  saving to artifacts/. This gives the app models trained on maximum history.
+
+================================================================================
+SECTION 13: PER-SERIES ERROR ANALYSIS
+================================================================================
+
+The overall WAPE (11.8%) hides huge variation across series:
+
+EASY TO FORECAST (low WAPE):
+  Whse_J|Category_019 → 6.75%   (biggest series: 287M actual demand)
+  Whse_J|Category_005 → 6.97%
+  Whse_J|Category_006 → 7.71%
+
+HARD TO FORECAST (high WAPE):
+  Whse_S|Category_020 → 121%    (tiny volume: 4,323 actual demand)
+  Whse_S|Category_007 → 93.1%
+  Whse_C|Category_032 → 91.1%
+
+PATTERN: Large, steady series are easy. Small, lumpy (intermittent) series
+         with many zero months are very hard. The model's low overall WAPE
+         is largely driven by the dominant Category_019 series (Whse_J alone
+         is 287M units out of the total, which is ~83% of all volume).
+
+================================================================================
+SECTION 14: RECURSIVE MULTI-STEP FORECASTING (pipeline.py → forecast_future())
+================================================================================
+
+STRATEGY: Recursive (also called "MIMO with feedback")
+
+HOW IT WORKS (step by step for horizon=3):
+  Step 1: Take the last known demand history for the series.
+          Compute lag_1, lag_2, ... lag_12, roll_mean_3, roll_mean_6, roll_std_3
+          from real historical data. Predict month t+1.
+  Step 2: Append predicted t+1 as if it were real. Recompute features.
+          Predict month t+2 using those features (lag_1 is now the t+1 prediction).
+  Step 3: Append t+2 prediction. Recompute. Predict t+3.
+
+LIMITATION: Errors compound. An overestimate at t+1 becomes an input for t+2,
+            which may then overestimate t+2, which feeds into t+3, etc.
+            Uncertainty grows with forecast horizon. Beyond 3 months, forecasts
+            become increasingly unreliable.
+
+UNCERTAINTY BAND IN APP:
+  The app shows a shaded band around the forecast:
+    Lower = Forecast × (1 - WAPE/100)
+    Upper = Forecast × (1 + WAPE/100)
+  Where WAPE = the per-series hold-out WAPE for that specific series.
+  This is a HEURISTIC (not a formal statistical interval) but gives intuition
+  about expected error for that particular series.
+
+================================================================================
+SECTION 15: THE STREAMLIT APP (app.py)
+================================================================================
+
+START COMMAND: streamlit run app.py
+REQUIREMENT:   artifacts/ folder must exist (run python train.py first)
+
+5 PAGES:
+
+PAGE 1 — Forecast
+  User selects: Warehouse, Product Category, Model (any of 6), Horizon (1–6 months)
+  Shows: historical demand chart + recursive forecast + uncertainty band
+  Shows: 3 KPI metrics (next month forecast, total horizon forecast, series WAPE)
+  Shows: Production Planning table — user can set safety stock % and current
+         inventory → app computes required production per month.
+  Download: forecast as CSV.
+
+PAGE 2 — Model Comparison
+  Table of all models with hold-out metrics
+  Bar chart of WAPE % (sorted)
+  CV summary table (mean ± std over 3 folds)
+  Explains why WAPE was chosen over MAPE.
+
+PAGE 3 — Data Overview
+  Cleaning statistics (raw rows, dropped, fixed, series count)
+  Total demand trend chart (all 33 series summed)
+  Top 10 categories by total demand bar chart
+  Preview of raw monthly data table.
+
+PAGE 4 — Error Analysis
+  Per-series WAPE table (all 33 series, sorted by actual volume)
+  Series drill-down: pick any series, see actual vs predicted chart for test period
+  Known Limitations section (see Section 16 below).
+
+PAGE 5 — About
+  Project summary paragraph.
+
+TECHNICAL DETAILS:
+  - Models saved to disk with joblib (binary serialization for sklearn objects)
+  - @st.cache_resource: models loaded ONCE per app session (fast subsequent loads)
+  - @st.cache_data: CSV/JSON tables cached (avoid re-reading files each interaction)
+  - Models refit on FULL data before saving (not just training split)
+
+================================================================================
+SECTION 16: LIMITATIONS
+================================================================================
+
+1. SHORT HISTORY
+   Only ~5 years of monthly data = ~60 data points per series.
+   Yearly seasonality (lag_12) is weakly captured with so few years.
+
+2. ORDERS ≠ TRUE CONSUMER DEMAND
+   The data shows what was ordered, not what consumers actually wanted.
+   Stock-outs, bulk orders, promotions, and pricing changes are invisible.
+   This means the model learns "historical ordering patterns", not true demand.
+
+3. DOMINATED BY ONE CATEGORY
+   Category_019 in Whse_J has 287 million units = ~83% of all volume.
+   The overall WAPE of 11.8% mostly reflects how well we predict this one series.
+   Smaller series have WAPE up to 121% (effectively useless forecasts).
+
+4. RECURSIVE ERROR COMPOUNDING
+   Multi-step forecasts beyond ~3 months degrade significantly because each
+   prediction feeds back as an input for the next prediction.
+
+5. INTERMITTENT DEMAND
+   Series with many zero-demand months are fundamentally hard to forecast with
+   lag-based ML models. Specialized methods (Croston's method, zero-inflated
+   models) would be more appropriate but were not implemented.
+
+6. NO EXTERNAL FEATURES
+   No pricing, promotional calendar, macroeconomic indicators, or weather data.
+   All features are purely historical demand patterns.
+
+================================================================================
+SECTION 17: CONCEPTS YOU SHOULD UNDERSTAND
+================================================================================
+
+WHAT IS WAPE?
+  Σ|y - ŷ| / Σ|y| × 100
+  "What percentage of total actual demand is our total absolute error?"
+  Example: Total demand = 1,000,000. Total absolute error = 118,000. WAPE = 11.8%.
+
+WHAT IS sMAPE?
+  Mean of [ |y - ŷ| / ((|y| + |ŷ|) / 2) ] × 100
+  Symmetric version of MAPE. Denominator uses average of actual and predicted,
+  so over- and under-forecasting are penalized equally.
+
+WHAT IS R²?
+  1 - (SS_residual / SS_total). Proportion of variance explained by the model.
+  R² = 1.0 = perfect. R² = 0 = model is no better than predicting the mean.
+  All our models: R² ≈ 0.98–0.99 (very high because Category_019 dominates
+  and is easy to fit — don't be fooled by this number).
+
+WHAT IS GRADIENT BOOSTING?
+  An ensemble method that builds trees SEQUENTIALLY.
+  Each new tree corrects the RESIDUAL ERRORS of the previous trees.
+  Parameters:
+    n_estimators = number of trees (300)
+    learning_rate = shrinkage factor (0.05 — small = slower but more stable)
+    max_depth = maximum depth of each tree (3 — shallow trees → regularization)
+
+WHAT IS HISTGRADIENTBOOSTING?
+  A faster variant of gradient boosting. Instead of exact splits, it bins
+  feature values into histograms (like LightGBM). Much faster on large datasets.
+  Also natively handles missing values (unlike standard GBR).
+
+WHAT IS RIDGE REGRESSION?
+  Linear regression with L2 regularization: adds λΣw² to the loss function.
+  Penalizes large weights → prevents overfitting. alpha=10 here.
+  Needs StandardScaler because L2 penalty is scale-sensitive.
+
+WHAT IS ROLLING-ORIGIN CV?
+  A cross-validation strategy for time series where:
+  - You always train on the PAST and validate on the FUTURE.
+  - The training window EXPANDS with each fold (more data each time).
+  - Avoids the leakage of k-fold CV for sequential data.
+
+WHAT IS A GLOBAL MODEL?
+  One model trained on data from ALL series simultaneously (vs. one model per series).
+  Pros: more training data, can learn patterns across series.
+  Cons: series with very different dynamics might confuse each other.
+  Here: log-transformation normalizes across scales, making one model viable.
+
+WHAT IS LOG1P / EXPM1?
+  log1p(x) = log(1 + x)   → safe for x=0 (log(0) is undefined, log(1)=0)
+  expm1(x) = e^x - 1      → inverse of log1p
+  Used to transform demand to log scale (and back) for training and prediction.
+
+================================================================================
+SECTION 18: PROJECT PIPELINE SUMMARY (in order)
+================================================================================
+
+  1. load_raw()         — read CSV, all columns as strings
+  2. clean()            — fix bracketed negatives, drop bad dates, filter to 2012–2016
+  3. monthly_series()   — aggregate to monthly, zero-fill, filter to 33 series
+  4. make_features()    — create 13 lag/rolling/calendar features, log-transform
+  5. time_split()       — cut last 6 months as hold-out test set
+  6. get_models()       — instantiate 5 sklearn models + baselines
+  7. fit_predict()      — train on log(Demand), predict, inverse-transform
+  8. metrics()          — compute WAPE, MAE, RMSE, R²
+  9. Rolling-origin CV  — 3 folds to robustly select champion
+  10. Grid search        — tune HGB hyperparameters on inner window
+  11. Champion selection — lowest mean CV WAPE → Gradient Boosting
+  12. Refit on full data — train final models on all 2012–2016 data
+  13. Save artifacts     — joblib (models), CSV (results), JSON (summary)
+  14. app.py             — Streamlit app reads artifacts, serves forecasts
+
+================================================================================
+SECTION 19: KEY NUMBERS TO MEMORIZE
+================================================================================
+
+  Raw rows in dataset         : 1,048,575
+  Date range used             : Jan 2012 – Dec 2016
+  Bracketed negatives fixed   : 10,469
+  Rows with bad dates dropped : 11,239
+  Exact duplicate rows        : 113,064 (kept)
+  Negative rows (returns)     : 5,899 (kept)
+  Final series count          : 33
+  Test set period             : Jul 2016 – Dec 2016 (6 months)
+  CV folds                    : 3 (rolling-origin, 6 months each)
+  Features used               : 13
+  Models compared             : 8 (3 baselines + 5 ML)
+  Tuning grid size            : 12 combinations
+  Champion model              : Gradient Boosting
+  Champion hold-out WAPE      : 11.8%
+  Best baseline WAPE          : 12.4% (3-month moving average)
+  Champion CV mean WAPE       : 13.2%
+  Best hold-out WAPE overall  : 10.3% (Hist Gradient Boosting, not chosen as champion)
+  Best series WAPE            : 6.75% (Whse_J|Category_019)
+  Worst series WAPE           : 121% (Whse_S|Category_020)
+  Category_019 volume share   : ~83% of total demand
+
+================================================================================
+SECTION 20: LIKELY VIVA QUESTIONS AND ANSWERS
+================================================================================
+
+Q: Why did you use WAPE instead of MAPE?
+A: MAPE divides each error by the monthly actual demand. If a month has near-zero
+   or zero demand, MAPE blows up to infinity. Our series have months with zero
+   demand (especially small series), so MAPE is unreliable. WAPE divides by the
+   SUM of all actual demand, which is always positive and meaningful.
+
+Q: How did you handle the fact that different series have very different scales?
+A: Two ways: (1) Log-transforming all demand-scale features and the target before
+   training, so the model operates in a compressed, comparable space. (2) WAPE
+   itself handles this — by computing error as a fraction of total demand, it's
+   scale-independent.
+
+Q: Why is R² so high (0.98–0.99) even for weaker models?
+A: Because Category_019 in Whse_J alone accounts for ~83% of total volume.
+   It has a very stable, predictable trend. Any model that predicts it reasonably
+   well will have a high R². R² is misleading here — WAPE tells a more honest story.
+
+Q: What is recursive forecasting and what's the risk?
+A: For multi-step forecasts (predicting multiple months ahead), each predicted
+   value is fed back as a lag feature for the next prediction. Risk: errors
+   compound — a bad prediction at t+1 corrupts inputs for t+2, t+3, etc.
+   Uncertainty grows with forecast horizon.
+
+Q: Why did you choose Gradient Boosting over Hist Gradient Boosting when HGB
+   has better hold-out performance?
+A: Hold-out is a single 6-month window and may not be representative. We chose
+   by rolling-origin CV (3 folds). On CV, GBR has mean WAPE 13.2% vs HGB's
+   14.47%, and lower standard deviation (2.62 vs 3.74). GBR is more consistently
+   good across different time windows — that's what matters in production.
+
+Q: What would you do differently with more data or time?
+A: (1) Add external features: promotions, pricing, macroeconomic indicators.
+   (2) Try sequence models (N-BEATS, Temporal Fusion Transformer) that are
+   designed for time series and can learn complex temporal patterns.
+   (3) Handle intermittent demand separately with Croston's method.
+   (4) Use conformal prediction for proper uncertainty quantification.
+   (5) More hyperparameter tuning with proper nested CV.
+
+Q: What is the difference between GBR and HGB in scikit-learn?
+A: Both are gradient boosting, but HGB uses histogram-based split finding
+   (like LightGBM) — it bins feature values before building trees. This makes
+   it significantly faster on large datasets and allows it to handle missing
+   values natively. The tradeoff is slight approximation in split points.
+
+Q: Why did you refit models on the full dataset before saving?
+A: The train/test split was only for EVALUATION purposes (to get honest error
+   estimates). Once we've chosen the best model, we retrain it on ALL available
+   data so the final deployed model has learned from as much history as possible.
+   The test set is no longer "unseen" once we've made our model choice.
+
+Q: How does the production planning view in the app work?
+A: User inputs a safety stock percentage and current inventory. The app adds
+   the safety stock buffer to forecasted demand (Target = Forecast × (1 + safety%))
+   then computes how much needs to be produced each month accounting for current
+   stock on hand (Production = max(0, Target_cumulative - Stock)).
+
+Q: Why did you keep exact duplicate rows?
+A: They represent real repeat orders on the same day. The same customer (or
+   different customers) ordering the same product on the same day is a legitimate
+   business event. Removing them would undercount actual demand. The pattern
+   (mostly round numbers) confirms these are genuine orders, not data entry errors.
+
+================================================================================
+END OF NOTES
+================================================================================
